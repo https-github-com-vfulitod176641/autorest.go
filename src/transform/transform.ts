@@ -355,76 +355,89 @@ function processOperationResponses(session: Session<CodeModel>) {
   if (session.model.language.go!.responseSchemas === undefined) {
     session.model.language.go!.responseSchemas = new Array<Schema>();
   }
-  for (const group of values(session.model.operationGroups)) {
-    for (const op of values(group.operations)) {
-      // annotate all exception types as errors; this is so we know to generate an Error() method
-      for (const ex of values(op.exceptions)) {
-        const marshallingFormat = getMarshallingFormat(ex.protocol);
-        if (marshallingFormat === 'na') {
-          // this is for the case where the 'default' response section
-          // doesn't specify a model (legal, mostly in the test server)
-          ex.language.go!.genericError = true;
+  // the operations are processed in two passes.  the first pass is
+  // for the synchronous operations, the LROs are in the second pass.
+  // this is to handle the case where there are sync and async APIs
+  // that return the same model (Widget).  we need to process the sync
+  // version first to create the response envelope as the async version
+  // depends on it.
+  let pass = 0;
+  while (pass < 2) {
+    for (const group of values(session.model.operationGroups)) {
+      for (const op of values(group.operations)) {
+        if (isLROOperation(op) && pass < 1) {
           continue;
         }
-        const schemaError = (<SchemaResponse>ex).schema;
-        if (isObjectSchema(schemaError)) {
-          for (const prop of values(schemaError.properties)) {
-            // adding the Inner prefix on error types, since errors in Go have an Error() method
-            // in order to implement the error interface. This causes errors to not be able to have
-            // an Error field as well, since it would cause confusion
-            if (prop.language.go!.name === 'Error') {
-              prop.language.go!.name = 'Inner' + prop.language.go!.name;
+        // annotate all exception types as errors; this is so we know to generate an Error() method
+        for (const ex of values(op.exceptions)) {
+          const marshallingFormat = getMarshallingFormat(ex.protocol);
+          if (marshallingFormat === 'na') {
+            // this is for the case where the 'default' response section
+            // doesn't specify a model (legal, mostly in the test server)
+            ex.language.go!.genericError = true;
+            continue;
+          }
+          const schemaError = (<SchemaResponse>ex).schema;
+          if (isObjectSchema(schemaError)) {
+            for (const prop of values(schemaError.properties)) {
+              // adding the Inner prefix on error types, since errors in Go have an Error() method
+              // in order to implement the error interface. This causes errors to not be able to have
+              // an Error field as well, since it would cause confusion
+              if (prop.language.go!.name === 'Error') {
+                prop.language.go!.name = 'Inner' + prop.language.go!.name;
+              }
             }
+            for (const child of values(schemaError.children?.all)) {
+              // annotate all child error types.  note that errorType has special
+              // significance which is why we use childErrorType instead.
+              child.language.go!.childErrorType = true;
+            }
+            if (schemaError.discriminator) {
+              // if the error is a discriminator we need to create an internal wrapper type
+              schemaError.language.go!.internalErrorType = camelCase(schemaError.language.go!.name);
+            }
+          } else {
+            schemaError.language.go!.name = schemaTypeToGoType(session.model, schemaError, true);
           }
-          for (const child of values(schemaError.children?.all)) {
-            // annotate all child error types.  note that errorType has special
-            // significance which is why we use childErrorType instead.
-            child.language.go!.childErrorType = true;
-          }
-          if (schemaError.discriminator) {
-            // if the error is a discriminator we need to create an internal wrapper type
-            schemaError.language.go!.internalErrorType = camelCase(schemaError.language.go!.name);
-          }
-        } else {
-          schemaError.language.go!.name = schemaTypeToGoType(session.model, schemaError, true);
+          schemaError.language.go!.errorType = true;
+          recursiveAddMarshallingFormat(schemaError, marshallingFormat);
         }
-        schemaError.language.go!.errorType = true;
-        recursiveAddMarshallingFormat(schemaError, marshallingFormat);
-      }
-      if (!op.responses) {
-        continue;
-      }
-      // recursively add the marshalling format to the responses if applicable.
-      // also remove any HTTP redirects from the list of responses.
-      const filtered = new Array<Response>();
-      for (const resp of values(op.responses)) {
-        if (skipRedirectStatusCode(<string>op.requests![0].protocol.http!.method, resp)) {
-          // redirects are transient status codes, they aren't actually returned
+        if (!op.responses) {
           continue;
         }
-        if (isSchemaResponse(resp)) {
-          resp.schema.language.go!.name = schemaTypeToGoType(session.model, resp.schema, true);
+        // recursively add the marshalling format to the responses if applicable.
+        // also remove any HTTP redirects from the list of responses.
+        const filtered = new Array<Response>();
+        for (const resp of values(op.responses)) {
+          if (skipRedirectStatusCode(<string>op.requests![0].protocol.http!.method, resp)) {
+            // redirects are transient status codes, they aren't actually returned
+            continue;
+          }
+          if (isSchemaResponse(resp)) {
+            resp.schema.language.go!.name = schemaTypeToGoType(session.model, resp.schema, true);
+          }
+          const marshallingFormat = getMarshallingFormat(resp.protocol);
+          if (marshallingFormat !== 'na' && isSchemaResponse(resp)) {
+            recursiveAddMarshallingFormat(resp.schema, marshallingFormat);
+          }
+          // fix up schema types for header responses
+          const httpResponse = <HttpResponse>resp.protocol.http;
+          for (const header of values(httpResponse.headers)) {
+            header.schema.language.go!.name = schemaTypeToGoType(session.model, header.schema, false);
+          }
+          filtered.push(resp);
         }
-        const marshallingFormat = getMarshallingFormat(resp.protocol);
-        if (marshallingFormat !== 'na' && isSchemaResponse(resp)) {
-          recursiveAddMarshallingFormat(resp.schema, marshallingFormat);
+        // replace with the filtered list if applicable
+        if (filtered.length === 0) {
+          // handling of operations with no responses expects an undefined list, not an empty one
+          op.responses = undefined;
+        } else if (op.responses.length !== filtered.length) {
+          op.responses = filtered;
         }
-        // fix up schema types for header responses
-        const httpResponse = <HttpResponse>resp.protocol.http;
-        for (const header of values(httpResponse.headers)) {
-          header.schema.language.go!.name = schemaTypeToGoType(session.model, header.schema, false);
-        }
-        filtered.push(resp);
+        createResponseType(session.model, group, op);
       }
-      // replace with the filtered list if applicable
-      if (filtered.length === 0) {
-        // handling of operations with no responses expects an undefined list, not an empty one
-        op.responses = undefined;
-      } else if (op.responses.length !== filtered.length) {
-        op.responses = filtered;
-      }
-      createResponseType(session.model, group, op);
     }
+    ++pass;
   }
 }
 
@@ -543,6 +556,13 @@ function createResponseType(codeModel: CodeModel, group: OperationGroup, op: Ope
       }
     } else if (!responseTypeCreated(codeModel, response.schema, isLROOperation(op))) {
       const isLRO = isLROOperation(op);
+      if (isLRO && response.schema.language.go!.responseType) {
+        // TODO: solve this
+        // sync and async APIs share the same response schema.
+        // if we get here it means we already created a responseType
+        // for the sync version.
+      }
+      // TODO: for LROs, the next line overwrites the sync responseType
       response.schema.language.go!.responseType = generateResponseTypeName(response.schema, isLRO);
       response.schema.language.go!.properties = [
         newProperty('RawResponse', 'RawResponse contains the underlying HTTP response.', newObject('http.Response', 'TODO'))
@@ -570,19 +590,6 @@ function createResponseType(codeModel: CodeModel, group: OperationGroup, op: Ope
         (<Array<Property>>response.schema.language.go!.properties).push(prop);
       }
       if (isLRO) {
-        const respTypeName = generateResponseTypeName(response.schema, false);
-        // we might also have to create a response envelope for the underlying type
-        if (!responseTypeCreated(codeModel, response.schema, false)) {
-          const respTypeObject = newObject(respTypeName.name, respTypeName.description);
-          respTypeObject.language.go!.responseType = respTypeName;
-          respTypeObject.language.go!.properties = [
-            newProperty('RawResponse', 'RawResponse contains the underlying HTTP response.', newObject('http.Response', 'TODO')),
-            newProperty(propName, `${propName} contains the response from the operation.`, response.schema)
-          ];
-          // add this response schema to the global list of response
-          const responseSchemas = <Array<Schema>>codeModel.language.go!.responseSchemas;
-          responseSchemas.push(respTypeObject);
-        }
         response.schema.language.go!.isLRO = true;
         let prop = newProperty('PollUntilDone',
           'PollUntilDone will poll the service endpoint until a terminal state is reached or an error is received',
